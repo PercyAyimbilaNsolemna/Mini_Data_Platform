@@ -22,8 +22,8 @@ volumes:
     driver: local
   airflow_logs:
     driver: local
-  airflow_dags:
-    driver: local
+  # airflow_dags:
+  #   driver: local
   airflow_db:
     driver: local
 
@@ -62,6 +62,7 @@ services:
     env_file:
       - .env
     environment:
+      PYTHONPATH: /opt/airflow 
       AIRFLOW__CORE__SQL_ALCHEMY_CONN: ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}
       AIRFLOW__CORE__EXECUTOR: ${AIRFLOW__CORE__EXECUTOR:-SequentialExecutor}
       AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
@@ -70,8 +71,9 @@ services:
       AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
     volumes:
       - airflow_logs:/opt/airflow/logs
-      - airflow_dags:/opt/airflow/dags
+      - ./airflow/dags:/opt/airflow/dags
       - airflow_db:/opt/airflow/airflow.db
+      - ./src:/opt/airflow/src
     depends_on:
       postgres:
         condition: service_healthy
