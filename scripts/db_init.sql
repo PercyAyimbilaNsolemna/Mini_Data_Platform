@@ -8,7 +8,9 @@ CREATE TABLE IF NOT EXISTS sales (
     price NUMERIC(10,2) NOT NULL,
     total_amount NUMERIC(12,2) GENERATED ALWAYS AS (quantity*price) STORED,
     country TEXT NOT NULL
-);-- Users
+);
+
+-- Users
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     username VARCHAR(50) UNIQUE NOT NULL,
@@ -19,7 +21,7 @@ CREATE TABLE IF NOT EXISTS users (
 -- Products
 CREATE TABLE IF NOT EXISTS products (
     id SERIAL PRIMARY KEY,
-    name VARCHAR(100) NOT NULL,
+    name VARCHAR(100) UNIQUE NOT NULL,
     description TEXT,
     price NUMERIC(10,2) NOT NULL,
     created_at TIMESTAMP DEFAULT NOW()

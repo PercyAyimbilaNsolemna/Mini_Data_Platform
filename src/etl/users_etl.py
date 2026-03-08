@@ -1,91 +1,138 @@
 # src/etl/users_etl.py
-import os
+"""
+Users ETL implementation using BaseETL and DataQualityChecks.
+
+This file contains:
+- cleaning
+- transformation
+- validation (dq checks)
+- batch load into Postgres
+"""
+
+import re
+from typing import Tuple
 import pandas as pd
-from typing import List, Dict
-from src.utils.logger import get_logger
-from src.utils.minio_utils import client as minio_client, upload_file_to_minio
-import psycopg2
+from psycopg2.extras import execute_batch
 
-logger = get_logger("users_etl")
+from src.etl.base_etl import BaseETL
+from src.data_quality.dq_checks import DataQualityChecks
+from src.data_quality.validation_rules import USER_USERNAME_REGEX
 
-class UsersETL:
-    """
-    ETL pipeline for users entity.
-    """
 
-    TEMP_DIR = "data/tmp/users"
+class UsersETL(BaseETL):
+    """ETL pipeline for users entity."""
 
-    def __init__(self):
-        os.makedirs(self.TEMP_DIR, exist_ok=True)
-        self.bucket = os.getenv("MINIO_BUCKET", "ecommerce-data")
-        self.db_conn = psycopg2.connect(
-            host=os.getenv("POSTGRES_HOST", "postgres"),
-            database=os.getenv("POSTGRES_DB", "ecommerce"),
-            user=os.getenv("POSTGRES_USER", "postgres"),
-            password=os.getenv("POSTGRES_PASSWORD", "postgres"),
-            port=os.getenv("POSTGRES_PORT", 5432),
-        )
+    def __init__(self) -> None:
+        """Initialize the UsersETL by delegating to BaseETL."""
+        super().__init__("users")
 
-    def run(self, files: List[Dict]):
-        for file_meta in files:
-            try:
-                local_path = self.download_file(file_meta)
-                df = self.read_csv(local_path)
-                valid_df, invalid_df = self.validate(df)
-                self.load_to_postgres(valid_df)
-                self.upload_invalid(file_meta, invalid_df)
-                self.update_file_status(file_meta, "processed")
-            except Exception as e:
-                logger.exception(f"ETL failed for file {file_meta['object_name']}")
-                self.update_file_status(file_meta, "failed")
+    # ---------- cleaning ----------
+    def clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Clean user DataFrame:
+        - strip whitespace
+        - normalize empty strings to NaN
+        - normalize case
+        - remove duplicates within batch
+        """
 
-    def download_file(self, file_meta: Dict) -> str:
-        local_path = os.path.join(self.TEMP_DIR, os.path.basename(file_meta["object_name"]))
-        minio_client.fget_object(self.bucket, file_meta["object_name"], local_path)
-        return local_path
+        df = df.copy()
 
-    def read_csv(self, local_path: str) -> pd.DataFrame:
-        return pd.read_csv(local_path)
+        # Trim whitespace
+        df["username"] = df.get("username", pd.Series()).astype(str).str.strip()
+        df["email"] = df.get("email", pd.Series()).astype(str).str.strip()
 
-    def validate(self, df: pd.DataFrame):
-        valid_rows = df.dropna(subset=["username", "email"])
-        valid_rows = valid_rows[valid_rows["email"].str.contains("@")]
-        invalid_rows = df.drop(valid_rows.index)
-        return valid_rows, invalid_rows
+        # Normalize case
+        df["username"] = df["username"].str.lower()
+        df["email"] = df["email"].str.lower()
 
-    def load_to_postgres(self, df: pd.DataFrame):
-        if df.empty:
+        # Normalize common null tokens
+        df = df.replace(
+                            {"": pd.NA, "None": pd.NA, "NULL": pd.NA}
+                        ).infer_objects(copy=False)
+
+        # Remove duplicates
+        df, duplicates = DataQualityChecks.remove_duplicates(df, subset=["username", "email"])
+
+        if not duplicates.empty:
+            # append reason for visibility if used downstream
+            duplicates["error_reason"] = "duplicate_record"
+
+        return df
+
+    # ---------- transform ----------
+    def transform_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Transform fields to canonical types/formats:
+        - lowercase username and email
+        """
+        if "username" in df.columns:
+            df["username"] = df["username"].str.lower()
+        if "email" in df.columns:
+            df["email"] = df["email"].str.lower()
+        return df
+
+    # ---------- validate ----------
+    def validate_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Apply validations and produce (valid_df, invalid_df).
+        Steps:
+        - required_fields
+        - email_format
+        - username regex
+        """
+        invalid_parts = []
+
+        # required fields
+        df, invalid = DataQualityChecks.required_fields(df, ["username", "email"])
+        invalid_parts.append(invalid)
+
+        # email format
+        df, invalid = DataQualityChecks.email_format(df, "email")
+        invalid_parts.append(invalid)
+
+        # username regex
+        df, invalid = DataQualityChecks.regex_match(df, "username", USER_USERNAME_REGEX, "invalid_username")
+        invalid_parts.append(invalid)
+
+        # Concatenate all invalid partitions (if any); keep unique invalid rows
+        invalid_frames = [p for p in invalid_parts if p is not None and not p.empty]
+
+        if invalid_frames:
+            invalid_df = pd.concat(invalid_frames, ignore_index=True)
+        else:
+            invalid_df = pd.DataFrame()
+
+        # Drop duplicates from invalid_df (some rows may fail multiple checks)
+        if not invalid_df.empty:
+            invalid_df = invalid_df.drop_duplicates()
+
+        return df.reset_index(drop=True), invalid_df.reset_index(drop=True)
+
+    # ---------- load ----------
+    def load_to_postgres(self, df: pd.DataFrame) -> None:
+        """
+        Bulk insert valid users into users table using psycopg2.execute_batch.
+        INSERT ignores conflicts on email to maintain idempotency.
+        """
+        if df is None or df.empty:
+            self.logger.info("No valid user rows to insert.")
             return
+
         cur = self.db_conn.cursor()
-        for _, row in df.iterrows():
-            cur.execute(
-                """
-                INSERT INTO users (username, email)
-                VALUES (%s, %s)
-                ON CONFLICT (email) DO NOTHING
-                """,
-                (row["username"], row["email"]),
-            )
+
+        insert_query = """
+            INSERT INTO users (username, email)
+            VALUES (%s, %s)
+            ON CONFLICT (email) DO NOTHING
+        """
+
+        # Build parameter list
+        data = [(row.username, row.email) for row in df.itertuples(index=False)]
+
+        # Execute in a batch for better performance
+        execute_batch(cur, insert_query, data)
+
         self.db_conn.commit()
         cur.close()
-
-    def upload_invalid(self, file_meta: Dict, df: pd.DataFrame):
-        if df.empty:
-            return
-        temp_file = os.path.join(self.TEMP_DIR, f"bad_{os.path.basename(file_meta['object_name'])}")
-        df.to_csv(temp_file, index=False)
-        object_path = f"bad_records/users/{os.path.basename(temp_file)}"
-        upload_file_to_minio(temp_file, self.bucket, object_path)
-
-    def update_file_status(self, file_meta: Dict, status: str):
-        cur = self.db_conn.cursor()
-        cur.execute(
-            """
-            UPDATE processed_files
-            SET status=%s, processed_at=NOW()
-            WHERE object_name=%s
-            """,
-            (status, file_meta["object_name"])
-        )
-        self.db_conn.commit()
-        cur.close()
+        self.logger.info("Inserted %d users into DB", len(data))
