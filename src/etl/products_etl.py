@@ -1,87 +1,109 @@
 # src/etl/products_etl.py
-import os
+"""
+Products ETL using BaseETL and DataQualityChecks.
+"""
+
+from typing import Tuple
 import pandas as pd
-from typing import List, Dict
-from src.utils.logger import get_logger
-from src.utils.minio_utils import client as minio_client, upload_file_to_minio
-import psycopg2
+from psycopg2.extras import execute_batch
 
-logger = get_logger("products_etl")
+from src.etl.base_etl import BaseETL
+from src.data_quality.dq_checks import DataQualityChecks
+from src.data_quality.validation_rules import PRODUCT_NAME_REGEX
 
-class ProductsETL:
-    TEMP_DIR = "data/tmp/products"
 
-    def __init__(self):
-        os.makedirs(self.TEMP_DIR, exist_ok=True)
-        self.bucket = os.getenv("MINIO_BUCKET", "ecommerce-data")
-        self.db_conn = psycopg2.connect(
-            host=os.getenv("POSTGRES_HOST", "postgres"),
-            database=os.getenv("POSTGRES_DB", "ecommerce"),
-            user=os.getenv("POSTGRES_USER", "postgres"),
-            password=os.getenv("POSTGRES_PASSWORD", "postgres"),
-            port=os.getenv("POSTGRES_PORT", 5432),
+class ProductsETL(BaseETL):
+    """ETL pipeline for products entity."""
+
+    def __init__(self) -> None:
+        super().__init__("products")
+
+    def clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Basic cleaning for products."""
+        df = df.copy()
+
+        # Clean name safely (preserve nulls)
+        if "name" in df.columns:
+            df["name"] = df["name"].astype("string").str.strip()
+
+        # Clean description safely
+        if "description" in df.columns:
+            df["description"] = df["description"].astype("string").str.strip()
+
+        # Normalize null tokens
+        df = df.replace({"": pd.NA, "None": pd.NA, "NULL": pd.NA})
+
+        # Remove duplicates by product name
+        df, duplicates = DataQualityChecks.remove_duplicates(df, subset=["name"])
+
+        return df
+
+    def transform_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Type casting for price and safe defaults."""
+        if "price" in df.columns:
+            df["price"] = pd.to_numeric(df["price"], errors="coerce")
+
+        return df
+
+    def validate_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Validate required fields and positive price."""
+        invalid_parts = []
+
+        # Required fields
+        df, invalid = DataQualityChecks.required_fields(df, ["name", "price"])
+        invalid_parts.append(invalid)
+
+        # Price must be positive
+        df, invalid = DataQualityChecks.positive_value(df, "price")
+        invalid_parts.append(invalid)
+
+        # Name regex
+        df, invalid = DataQualityChecks.regex_match(
+            df,
+            "name",
+            PRODUCT_NAME_REGEX,
+            "invalid_product_name",
         )
+        invalid_parts.append(invalid)
 
-    def run(self, files: List[Dict]):
-        for file_meta in files:
-            try:
-                local_path = self.download_file(file_meta)
-                df = self.read_csv(local_path)
-                valid_df, invalid_df = self.validate(df)
-                self.load_to_postgres(valid_df)
-                self.upload_invalid(file_meta, invalid_df)
-                self.update_file_status(file_meta, "processed")
-            except Exception as e:
-                logger.exception(f"ETL failed for file {file_meta['object_name']}")
-                self.update_file_status(file_meta, "failed")
+        invalid_frames = [p for p in invalid_parts if p is not None and not p.empty]
 
-    def download_file(self, file_meta: Dict) -> str:
-        local_path = os.path.join(self.TEMP_DIR, os.path.basename(file_meta["object_name"]))
-        minio_client.fget_object(self.bucket, file_meta["object_name"], local_path)
-        return local_path
+        if invalid_frames:
+            invalid_df = pd.concat(invalid_frames, ignore_index=True)
+        else:
+            invalid_df = pd.DataFrame()
 
-    def read_csv(self, local_path: str) -> pd.DataFrame:
-        return pd.read_csv(local_path)
+        if not invalid_df.empty:
+            invalid_df = invalid_df.drop_duplicates()
 
-    def validate(self, df: pd.DataFrame):
-        valid = df.dropna(subset=["name", "price"])
-        valid = valid[valid["price"] > 0]
-        invalid = df.drop(valid.index)
-        return valid, invalid
+        return df.reset_index(drop=True), invalid_df.reset_index(drop=True)
 
-    def load_to_postgres(self, df: pd.DataFrame):
-        if df.empty:
+    def load_to_postgres(self, df: pd.DataFrame) -> None:
+        """Bulk insert products. Use ON CONFLICT on name to prevent duplicates."""
+        if df is None or df.empty:
+            self.logger.info("No valid product rows to insert.")
             return
+
         cur = self.db_conn.cursor()
-        for _, row in df.iterrows():
-            cur.execute(
-                """
-                INSERT INTO products (name, description, price)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (id) DO NOTHING
-                """,
-                (row["name"], row.get("description", None), row["price"]),
+
+        insert_q = """
+            INSERT INTO products (name, description, price)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (name) DO NOTHING
+        """
+
+        data = [
+            (
+                r.name,
+                r.description if hasattr(r, "description") else None,
+                r.price,
             )
+            for r in df.itertuples(index=False)
+        ]
+
+        execute_batch(cur, insert_q, data)
+
         self.db_conn.commit()
         cur.close()
 
-    def upload_invalid(self, file_meta: Dict, df: pd.DataFrame):
-        if df.empty:
-            return
-        temp_file = os.path.join(self.TEMP_DIR, f"bad_{os.path.basename(file_meta['object_name'])}")
-        df.to_csv(temp_file, index=False)
-        object_path = f"bad_records/products/{os.path.basename(temp_file)}"
-        upload_file_to_minio(temp_file, self.bucket, object_path)
-
-    def update_file_status(self, file_meta: Dict, status: str):
-        cur = self.db_conn.cursor()
-        cur.execute(
-            """
-            UPDATE processed_files
-            SET status=%s, processed_at=NOW()
-            WHERE object_name=%s
-            """,
-            (status, file_meta["object_name"]),
-        )
-        self.db_conn.commit()
-        cur.close()
+        self.logger.info("Inserted %d products", len(data))
