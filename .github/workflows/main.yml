@@ -1,3 +1,4 @@
+
 name: Mini Data Platform CI/CD
 
 on:
@@ -82,6 +83,39 @@ jobs:
       - name: Pull latest image
         run: |
           docker pull ${{ secrets.DOCKER_USERNAME }}/mini-data-platform:latest
+
+      - name: Create .env file
+        run: |
+          cat <<EOF > .env
+          POSTGRES_USER=${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB=${{ secrets.POSTGRES_DB }}
+          POSTGRES_PORT=${{ secrets.POSTGRES_PORT }}
+
+          AIRFLOW_ADMIN_USERNAME=${{ secrets.AIRFLOW_ADMIN_USERNAME }}
+          AIRFLOW_ADMIN_PASSWORD=${{ secrets.AIRFLOW_ADMIN_PASSWORD }}
+          AIRFLOW__CORE__FERNET_KEY=${{ secrets.AIRFLOW__CORE__FERNET_KEY }}
+          AIRFLOW__CORE__EXECUTOR=${{ secrets.AIRFLOW__CORE__EXECUTOR }}
+          AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=${{ secrets.AIRFLOW__DATABASE__SQL_ALCHEMY_CONN }}
+          AIRFLOW__CORE__LOAD_EXAMPLES=${{ secrets.AIRFLOW__CORE__LOAD_EXAMPLES }}
+          AIRFLOW__CORE__ENABLE_XCOM_PICKLING=${{ secrets.AIRFLOW__CORE__ENABLE_XCOM_PICKLING }}
+          AIRFLOW__LOGGING__LOGGING_LEVEL=${{ secrets.AIRFLOW__LOGGING__LOGGING_LEVEL }}
+
+          MINIO_ROOT_USER=${{ secrets.MINIO_ROOT_USER }}
+          MINIO_ROOT_PASSWORD=${{ secrets.MINIO_ROOT_PASSWORD }}
+          MINIO_ENDPOINT=${{ secrets.MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY=${{ secrets.MINIO_ACCESS_KEY }}
+          MINIO_SECRET_KEY=${{ secrets.MINIO_SECRET_KEY }}
+          MINIO_USE_SSL=${{ secrets.MINIO_USE_SSL }}
+
+          MB_DB_TYPE=${{ secrets.MB_DB_TYPE }}
+          MB_DB_DBNAME=${{ secrets.MB_DB_DBNAME }}
+          MB_DB_PORT=${{ secrets.MB_DB_PORT }}
+          MB_DB_USER=${{ secrets.MB_DB_USER }}
+          MB_DB_PASS=${{ secrets.MB_DB_PASS }}
+          MB_DB_HOST=${{ secrets.MB_DB_HOST }}
+          MB_JETTY_PORT=${{ secrets.MB_JETTY_PORT }}
+          EOF
 
       - name: Deploy stack
         run: |
