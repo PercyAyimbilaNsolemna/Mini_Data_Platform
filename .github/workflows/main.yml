@@ -60,15 +60,18 @@ jobs:
 
       - name: Build Docker Image
         run: |
-          docker build -t ${{ secrets.DOCKER_USERNAME }}/mini-data-platform:latest .
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/mini-data-platform:${{ github.sha }} .
+          docker tag ${{ secrets.DOCKER_USERNAME }}/mini-data-platform:${{ github.sha }} ${{ secrets.DOCKER_USERNAME }}/mini-data-platform:latest
 
-      - name: Push Docker Image
+      - name: Push Docker Images
         run: |
+          docker push ${{ secrets.DOCKER_USERNAME }}/mini-data-platform:${{ github.sha }}
           docker push ${{ secrets.DOCKER_USERNAME }}/mini-data-platform:latest
 
 
   cd:
     needs: ci
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     steps:
