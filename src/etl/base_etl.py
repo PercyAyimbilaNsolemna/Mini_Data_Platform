@@ -129,13 +129,16 @@ class BaseETL:
 
             except Exception:
                 self.logger.exception("ETL failed for file: %s", object_name)
-
                 try:
+                    if self.db_conn:
+                        self.db_conn.rollback()  # ← clear aborted transaction
                     self.update_file_status(file_meta, "failed")
                 except Exception:
                     self.logger.exception(
                         "Failed to update file status for %s", object_name
                     )
+                raise  # ← Airflow must see this as a failure
+
 
     # ---------- Extraction helpers ----------
 
