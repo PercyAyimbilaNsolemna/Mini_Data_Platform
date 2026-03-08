@@ -1,0 +1,153 @@
+# Docker Compose configuration for Mini Data Platform
+# Production-ready setup with health checks, persistent volumes, and dependency management
+
+#version: "3.9"
+
+x-healthcheck: &default-healthcheck
+  interval: 30s
+  timeout: 10s
+  retries: 5
+  start_period: 5s
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  minio_data:
+    driver: local
+  metabase_data:
+    driver: local
+  # airflow_logs:
+  #   driver: local
+  # airflow_dags:
+  #   driver: local
+  airflow_db:
+    driver: local
+
+services:
+  postgres:
+    image: postgres:15.3
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/db_init.sql:/docker-entrypoint-initdb.d/db_init.sql:ro
+    ports:
+      - "5433:5432"
+    networks:
+      - app-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} -h localhost"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  airflow:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    # image: mini_data_platform:latest
+    image: percyayimbila/mini-data-platform:latest
+    container_name: airflow
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /opt/airflow 
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}
+      AIRFLOW__CORE__EXECUTOR: ${AIRFLOW__CORE__EXECUTOR:-SequentialExecutor}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: ${AIRFLOW__CORE__LOAD_EXAMPLES:-False}
+      AIRFLOW__CORE__ENABLE_XCOM_PICKLING: ${AIRFLOW__CORE__ENABLE_XCOM_PICKLING:-True}
+      AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+    volumes:
+      - ./logs:/opt/airflow/logs
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow_db:/opt/airflow/airflow.db
+      - ./src:/opt/airflow/src
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    networks:
+      - app-network
+    healthcheck:
+      <<: *default-healthcheck
+      start_period: 30s
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  minio:
+    image: minio/minio:RELEASE.2025-02-28T09-55-16Z
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - app-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  metabase:
+    image: metabase/metabase:v0.48.6
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MB_DB_TYPE: ${MB_DB_TYPE}
+      MB_DB_DBNAME: ${MB_DB_DBNAME}
+      MB_DB_PORT: ${MB_DB_PORT}
+      MB_DB_USER: ${MB_DB_USER}
+      MB_DB_PASS: ${MB_DB_PASS}
+      MB_DB_HOST: ${MB_DB_HOST}
+      MB_JETTY_PORT: ${MB_JETTY_PORT}
+    volumes:
+      - metabase_data:/metabase-data
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-network
+    healthcheck:
+      <<: *default-healthcheck
+      start_period: 60s
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
