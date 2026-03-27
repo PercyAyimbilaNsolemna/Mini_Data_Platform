@@ -93,22 +93,11 @@ The system works through an automated pipeline:
 ---
 
 ## Architecture Overview
+<div align="center">
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         Docker Environment                          │
-│                                                                     │
-│  ┌───────────┐    ┌───────┐    ┌─────────┐    ┌─────┐    ┌──────┐ │
-│  │  Data     │───▶│ MinIO │───▶│ Airflow │───▶│ ETL │───▶│  PG  │ │
-│  │ Generator │    │       │    │         │    │     │    │      │ │
-│  └───────────┘    └───────┘    └─────────┘    └─────┘    └──┬───┘ │
-│                                                              │      │
-│                                                         ┌────▼───┐ │
-│                                               User ◀────│Metabase│ │
-│                                                         └────────┘ │
-└─────────────────────────────────────────────────────────────────────┘
-```
+![architecture](docs/pipeline.drawio.png)
 
+</div>
 The entire platform runs inside Docker containers. Components interact through an internal Docker network.
 
 ---
