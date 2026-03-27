@@ -1,37 +1,16 @@
-"""
-File Registry
-
-This module manages tracking of files detected in MinIO.
-It ensures we only process NEW files and avoid duplicates.
-
-Responsibilities:
-1. Check if a file already exists in the tracking table
-2. Insert newly detected files
-3. Return files that need processing
-
-Author: Data Engineering Team
-"""
-
 import os
 import psycopg2
+from psycopg2.extras import execute_values
 from typing import List, Dict
 
 from src.utils.logger import get_logger
-
 
 logger = get_logger("file_registry")
 
 
 class FileRegistry:
-    """
-    Handles interactions with the processed_files tracking table.
-    """
 
     def __init__(self):
-        """
-        Initialize database connection parameters from environment variables.
-        """
-
         self.db_host = os.getenv("POSTGRES_HOST", "postgres")
         self.db_name = os.getenv("POSTGRES_DB", "ecommerce")
         self.db_user = os.getenv("POSTGRES_USER", "postgres")
@@ -39,10 +18,6 @@ class FileRegistry:
         self.db_port = os.getenv("POSTGRES_PORT", "5432")
 
     def _get_connection(self):
-        """
-        Create a PostgreSQL database connection.
-        """
-
         return psycopg2.connect(
             host=self.db_host,
             database=self.db_name,
@@ -51,60 +26,52 @@ class FileRegistry:
             port=self.db_port,
         )
 
+    # 1. BULK REGISTER FILES (FAST + SAFE)
     def register_new_files(self, files: List[Dict]) -> List[Dict]:
         """
-        Insert new files into the processed_files table.
-
-        Only files that do not already exist will be inserted.
-
-        Returns:
-            List[Dict]: files that are newly registered
+        Insert files in bulk using ON CONFLICT.
+        Returns only newly inserted files.
         """
 
-        new_files = []
+        if not files:
+            return []
 
         conn = self._get_connection()
         cursor = conn.cursor()
 
         try:
+            values = [
+                (f["bucket_name"], f["object_name"], f["entity_type"])
+                for f in files
+            ]
 
-            for file in files:
+            query = """
+                INSERT INTO processed_files (bucket_name, object_name, entity_type)
+                VALUES %s
+                ON CONFLICT (object_name) DO NOTHING
+                RETURNING bucket_name, object_name, entity_type;
+            """
 
-                bucket = file["bucket_name"]
-                object_name = file["object_name"]
-                entity = file["entity_type"]
+            execute_values(cursor, query, values)
 
-                # Check if file already exists
-                cursor.execute(
-                    """
-                    SELECT 1 FROM processed_files
-                    WHERE object_name = %s
-                    """,
-                    (object_name,)
-                )
-
-                exists = cursor.fetchone()
-
-                if exists:
-                    continue
-
-                # Insert new file record
-                cursor.execute(
-                    """
-                    INSERT INTO processed_files
-                    (bucket_name, object_name, entity_type, status)
-                    VALUES (%s, %s, %s, 'pending')
-                    """,
-                    (bucket, object_name, entity)
-                )
-
-                new_files.append(file)
+            inserted_rows = cursor.fetchall()
 
             conn.commit()
 
-            logger.info(f"Registered {len(new_files)} new files")
+            new_files = [
+                {
+                    "bucket_name": r[0],
+                    "object_name": r[1],
+                    "entity_type": r[2],
+                }
+                for r in inserted_rows
+            ]
 
-        except Exception as e:
+            logger.info(f"Registered {len(new_files)} new files (bulk)")
+
+            return new_files
+
+        except Exception:
             logger.exception("Error registering files")
             conn.rollback()
             raise
@@ -113,47 +80,64 @@ class FileRegistry:
             cursor.close()
             conn.close()
 
-        return new_files
-
-    def fetch_pending_files(self) -> List[Dict]:
+    # 2. FETCH FILES SAFELY FOR PROCESSING (NO DUPLICATES)
+    def fetch_pending_files(self, batch_size: int = 10) -> List[Dict]:
         """
-        Retrieve files that are pending processing.
-
-        Returns:
-            List of files ready for ingestion.
+        Fetch a batch of pending files and lock them for processing.
+        Prevents multiple workers from picking same files.
         """
 
         conn = self._get_connection()
         cursor = conn.cursor()
 
         try:
-
-            cursor.execute(
-                """
-                SELECT bucket_name, object_name, entity_type
+            query = """
+                SELECT id, bucket_name, object_name, entity_type
                 FROM processed_files
                 WHERE status = 'pending'
                 ORDER BY detected_at ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            """
+
+            cursor.execute(query, (batch_size,))
+            rows = cursor.fetchall()
+
+            if not rows:
+                conn.commit()
+                return []
+
+            ids = [r[0] for r in rows]
+
+            # Mark as processing
+            cursor.execute(
                 """
+                UPDATE processed_files
+                SET status = 'processing'
+                WHERE id = ANY(%s)
+                """,
+                (ids,)
             )
 
-            rows = cursor.fetchall()
+            conn.commit()
 
             files = [
                 {
-                    "bucket_name": r[0],
-                    "object_name": r[1],
-                    "entity_type": r[2],
+                    "id": r[0],
+                    "bucket_name": r[1],
+                    "object_name": r[2],
+                    "entity_type": r[3],
                 }
                 for r in rows
             ]
 
-            logger.info(f"Fetched {len(files)} pending files")
+            logger.info(f"Fetched {len(files)} files for processing")
 
             return files
 
         except Exception:
             logger.exception("Failed to fetch pending files")
+            conn.rollback()
             raise
 
         finally:
